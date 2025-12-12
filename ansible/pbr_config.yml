@@ -1,0 +1,133 @@
+---
+- name: Configure Policy-Based Routing for Multi-IP Azure VM
+  hosts: multi_ip_vm
+  become: yes
+  vars:
+    # Variables passed via --extra-vars
+    vm_private_ips_json: "{{ vm_private_ips_json }}"
+    interface_name: "{{ nic_name }}"
+    subnet_gateway: "10.0.1.1" # Standard Azure VNet gateway (first address in subnet range)
+    
+  tasks:
+    - name: Ensure iproute2 is installed
+      apt:
+        name: iproute2
+        state: present
+        update_cache: yes
+        
+    - name: Parse private IP list from JSON string
+      set_fact:
+        vm_private_ips: "{{ vm_private_ips_json | from_json }}"
+        
+    - name: Overwrite NIC name with Linux interface name
+      set_fact:
+        interface_name: "{{ ansible_default_ipv4.interface }}"        
+        
+    - name: Show detected IPs for debugging
+      debug:
+        var: vm_private_ips
+
+    - name: Add custom routing tables to /etc/iproute2/rt_tables
+      ansible.builtin.lineinfile:
+        path: /etc/iproute2/rt_tables
+        line: "{{ 100 + loop_index + 1 }} ip_table_{{ loop_index + 1 }}"
+      loop: "{{ vm_private_ips }}"  
+      loop_control:
+        index_var: loop_index
+        
+    - name: Configure PBR - Create custom routing script for persistence
+      copy:
+        content: |
+          #!/bin/bash
+          # PBR configuration for Azure Multi-IP VM
+          GW={{ subnet_gateway }}
+          DEV={{ interface_name }}
+          
+          # Remove existing rules and routes for idempotency (optional, but good practice)
+          # ip rule flush
+          # ip route flush table main
+          
+          {% for ip in vm_private_ips %}
+          IP_{{ loop.index }}={{ ip }}
+          TABLE_ID_{{ loop.index }}={{ 100 + loop.index }}
+          
+          # Add default route to the custom table
+          # Check if route exists before adding for idempotency
+          ip route add default via $GW table $TABLE_ID_{{ loop.index }} 2>/dev/null || true
+          
+          # Create rule to route traffic originating from the private IP through its custom table
+          ip rule add from $IP_{{ loop.index }} table $TABLE_ID_{{ loop.index }} priority {{ 100 + loop.index }} 2>/dev/null || true
+          {% endfor %}
+          
+          # Ensure primary interface route is correctly set up
+          ip route add $GW dev $DEV 2>/dev/null || true
+        dest: /usr/local/bin/configure-pbr.sh
+        mode: '0755'
+
+    - name: Create Systemd service to run PBR script on boot
+      copy:
+        content: |
+          [Unit]
+          Description=Configure Azure Multi-IP Policy Based Routing
+          After=network-online.target network.target
+          Wants=network-online.target network.target
+
+          [Service]
+          Type=forking
+          ExecStartPre=/bin/sleep 5
+          ExecStart=/usr/local/bin/configure-pbr.sh
+          RemainAfterExit=yes
+
+          [Install]
+          WantedBy=multi-user.target
+        dest: /etc/systemd/system/pbr-azure.service
+        mode: '0644'
+
+    - name: Enable and start PBR service
+      systemd:
+        name: pbr-azure
+        daemon_reload: yes
+        enabled: yes
+        state: started
+        
+    # --- Verification (Optional, but useful for Ansible logs) ---
+    - name: Verify IP addresses on interface (show aliases)
+      command: ip addr show {{ interface_name }}
+      register: ip_verify
+      changed_when: false
+      
+    - name: Show PBR rules
+      command: ip rule show
+      register: rule_verify
+      changed_when: false
+      
+    - name: Display verification results
+      debug:
+        msg: 
+          - "--- Interface IPs ---"
+          - "{{ ip_verify.stdout_lines }}"
+          - "--- PBR Rules ---"
+          - "{{ rule_verify.stdout_lines }}"
+
+    - name: Upload IP map for verification
+      ansible.builtin.copy:
+        src: ../ip_map.txt        # Шлях до файлу на локальній машині (../ виходить з папки ansible/)
+        dest: /tmp/ip_map.txt     # Шлях, який очікує verify_pbr.sh
+        mode: '0644'
+
+    - name: Upload PBR verification script
+      ansible.builtin.copy:
+        src: ../verify_pbr.sh      
+        dest: /tmp/verify_pbr.sh
+        mode: '0755'
+
+    - name: Execute PBR verification script
+      ansible.builtin.command: /tmp/verify_pbr.sh
+      register: pbr_verification_output
+      changed_when: false
+
+    - name: Display Final Verification Results
+      ansible.builtin.debug:
+        msg: "{{ pbr_verification_output.stdout_lines + pbr_verification_output.stderr_lines }}"
+
+    # --- Якщо скрипт verify_pbr.sh повертає код помилки 1, Ansible завершиться з помилкою ---          
