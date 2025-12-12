@@ -11,7 +11,6 @@
 ├── ansible/
 │   ├── inventory.ini             # Inventory для Ansible
 │   ├── pbr_config.yml          # Playbook для налаштування PBR
-│   └── run.sh                  # Скрипт для запуску Playbook
 ├── full_task_runner.sh       # Головний скрипт, який виконує весь процес
 ├── ansible.cfg       		  # Конфігурація Ansible
 ├── cleanup.sh                # Скрипт для видалення ресурсів
